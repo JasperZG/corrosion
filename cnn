@@ -1,0 +1,77 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SelfAttention(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        # project input to lower‑dim query/key and full‑dim value
+        self.query = nn.Conv2d(in_channels, in_channels // 8, 1)
+        self.key   = nn.Conv2d(in_channels, in_channels // 8, 1)
+        self.value = nn.Conv2d(in_channels, in_channels,    1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        B,C,H,W = x.size()
+        # flatten spatial dims
+        q = self.query(x).view(B, -1, H*W).permute(0,2,1)  # B×(H·W)×(C/8)
+        k = self.key(x).view(B, -1, H*W)                   # B×(C/8)×(H·W)
+        attn = torch.softmax(torch.bmm(q, k), dim=-1)      # B×(H·W)×(H·W)
+        v = self.value(x).view(B, -1, H*W)                 # B×C×(H·W)
+        out = torch.bmm(v, attn.permute(0,2,1))            # B×C×(H·W)
+        out = out.view(B, C, H, W)
+        return self.gamma * out + x
+
+
+class AttentionCNN(nn.Module):
+    def __init__(self, img_channels=3, num_classes=2):
+        super().__init__()
+        # 1) Conv → Attention → Pool
+        self.block1 = nn.Sequential(
+            nn.Conv2d(img_channels, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.attn1 = SelfAttention(64)
+        self.pool1 = nn.MaxPool2d(2)  # 64×32×32
+        
+        # 2) Conv → Attention → Pool
+        self.block2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.attn2 = SelfAttention(128)
+        self.pool2 = nn.MaxPool2d(2)  # 128×16×16
+        
+        # 3) Conv → Pool
+        self.block3 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.pool3 = nn.AdaptiveAvgPool2d(1)  # 256×1×1
+        
+        # final classifier
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256, 128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+        
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.attn1(x)
+        x = self.pool1(x)
+        
+        x = self.block2(x)
+        x = self.attn2(x)
+        x = self.pool2(x)
+        
+        x = self.block3(x)
+        x = self.pool3(x)
+        
+        logits = self.classifier(x)
+        return logits
