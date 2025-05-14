@@ -1,0 +1,117 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+class PixelNorm(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.epsilon = 1e-8
+
+    def forward(self, x):
+        return x / torch.sqrt(torch.mean(x ** 2, dim=1, keepdim=True) + self.epsilon)
+
+class WSConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        self.scale = (2 / (in_channels * kernel_size ** 2)) ** 0.5
+        nn.init.normal_(self.conv.weight)
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+
+    def forward(self, x):
+        return self.conv(x * self.scale) + self.bias.view(1, -1, 1, 1)
+
+class MappingNetwork(nn.Module):
+    def __init__(self, z_dim, w_dim):
+        super().__init__()
+        self.fc = nn.Sequential(
+            PixelNorm(),
+            *[self._linear_block(z_dim if i == 0 else w_dim, w_dim) for i in range(8)]
+        )
+
+    def _linear_block(self, in_features, out_features):
+        return nn.Sequential(
+            nn.Linear(in_features, out_features),
+            nn.LeakyReLU(0.2)
+        )
+
+    def forward(self, z):
+        return self.fc(z)
+
+class AdaIN(nn.Module):
+    def __init__(self, channels, w_dim):
+        super().__init__()
+        self.instance_norm = nn.InstanceNorm2d(channels)
+        self.style_scale = nn.Linear(w_dim, channels)
+        self.style_bias = nn.Linear(w_dim, channels)
+
+    def forward(self, x, w):
+        style_scale = self.style_scale(w).view(-1, x.shape[1], 1, 1)
+        style_bias = self.style_bias(w).view(-1, x.shape[1], 1, 1)
+        return style_scale * self.instance_norm(x) + style_bias
+
+class InjectNoise(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(self, x):
+        noise = torch.randn_like(x)
+        return x + self.weight * noise
+
+class GenBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, w_dim):
+        super().__init__()
+        self.conv1 = WSConv2d(in_channels, out_channels, 3, 1, 1)
+        self.conv2 = WSConv2d(out_channels, out_channels, 3, 1, 1)
+        self.noise1 = InjectNoise(out_channels)
+        self.noise2 = InjectNoise(out_channels)
+        self.adain1 = AdaIN(out_channels, w_dim)
+        self.adain2 = AdaIN(out_channels, w_dim)
+        self.leaky = nn.LeakyReLU(0.2)
+
+    def forward(self, x, w):
+        x = self.adain1(self.leaky(self.noise1(self.conv1(x))), w)
+        x = self.adain2(self.leaky(self.noise2(self.conv2(x))), w)
+        return x
+
+class Generator(nn.Module):
+    def __init__(self, z_dim, w_dim, in_channels, img_channels=3):
+        super().__init__()
+        self.starting_constant = nn.Parameter(torch.ones(1, in_channels, 4, 4))
+        self.map = MappingNetwork(z_dim, w_dim)
+
+        self.initial_adain1 = AdaIN(in_channels, w_dim)
+        self.initial_adain2 = AdaIN(in_channels, w_dim)
+        self.initial_noise1 = InjectNoise(in_channels)
+        self.initial_noise2 = InjectNoise(in_channels)
+        self.initial_conv = WSConv2d(in_channels, in_channels, 3, 1, 1)
+
+        self.rgb_layers = nn.ModuleList([WSConv2d(in_channels, img_channels, 1, 1, 0)])
+        self.blocks = nn.ModuleList()
+
+    def add_block(self, in_channels, out_channels, w_dim):
+        self.blocks.append(GenBlock(in_channels, out_channels, w_dim))
+        self.rgb_layers.append(WSConv2d(out_channels, 3, 1, 1, 0))
+
+    def fade_in(self, alpha, upscaled, generated):
+        return alpha * generated + (1 - alpha) * upscaled
+
+    def forward(self, noise, alpha, steps):
+        w = self.map(noise)
+        x = self.starting_constant
+        x = self.initial_adain1(self.initial_noise1(x), w)
+        x = self.initial_conv(x)
+        x = self.initial_adain2(self.initial_noise2(x), w)
+
+        if steps == 0:
+            return self.rgb_layers[0](x)
+
+        for step in range(steps):
+            upscaled = F.interpolate(x, scale_factor=2, mode="bilinear")
+            x = self.blocks[step](upscaled, w)
+
+        upscaled = self.rgb_layers[steps - 1](F.interpolate(x, scale_factor=2, mode="bilinear"))
+        generated = self.rgb_layers[steps](x)
+        return self.fade_in(alpha, upscaled, generated)
