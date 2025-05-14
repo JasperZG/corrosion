@@ -1,168 +1,152 @@
+import os
 import torch
 import torch.nn as nn
-import torchvision.transforms as transforms
-from torchvision.utils import save_image
 from torch.utils.data import DataLoader
+from torchvision import transforms
 from torchvision.datasets import ImageFolder
-import os
+from torchvision.utils import save_image
 
-# Hyperparameters
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 32
-LATENT_DIM = 100
-IMG_SIZE = 128
+# ─── Hyperparameters ──────────────────────────────────────────────────────────
+DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
+DATA_PATH    = "corrosionset2/train"
+BATCH_SIZE   = 64
+IMG_SIZE     = 64
 IMG_CHANNELS = 3
-EPOCHS = 25
-LEARNING_RATE = 0.0002
-DATASET_PATH = "corrosionset2/train"
+LATENT_DIM   = 100
+EMBED_DIM    = 50    # size of label embedding
+NUM_CLASSES  = len(os.listdir(DATA_PATH))
+EPOCHS       = 100
+LR           = 2e-4
+BETAS        = (0.5, 0.999)
+SAVE_DIR     = "cgan_images"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-# Create output directory for results
-os.makedirs("multi_scale_cgan_images", exist_ok=True)
-
-# Transformations
+# ─── Dataset & Dataloader ─────────────────────────────────────────────────────
 transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.Resize((IMG_SIZE,IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize([0.5] * IMG_CHANNELS, [0.5] * IMG_CHANNELS),
+    transforms.Normalize([0.5]*IMG_CHANNELS, [0.5]*IMG_CHANNELS),
 ])
+dataset = ImageFolder(root=DATA_PATH, transform=transform)
+loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
 
-# Dataset and Dataloader
-dataset = ImageFolder(root=DATASET_PATH, transform=transform)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-# Attention Block
-class SelfAttention(nn.Module):
-    def __init__(self, in_channels):
-        super(SelfAttention, self).__init__()
-        self.query = nn.Conv2d(in_channels, in_channels // 8, 1)
-        self.key = nn.Conv2d(in_channels, in_channels // 8, 1)
-        self.value = nn.Conv2d(in_channels, in_channels, 1)
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        batch, channels, height, width = x.size()
-        query = self.query(x).view(batch, -1, height * width).permute(0, 2, 1)
-        key = self.key(x).view(batch, -1, height * width)
-        attention = torch.softmax(torch.bmm(query, key), dim=-1)
-        value = self.value(x).view(batch, -1, height * width)
-
-        out = torch.bmm(value, attention.permute(0, 2, 1))
-        out = out.view(batch, channels, height, width)
-        return self.gamma * out + x
-
-# Generator
+# ─── Generator ─────────────────────────────────────────────────────────────────
 class Generator(nn.Module):
-    def __init__(self, latent_dim, img_channels, img_size):
-        super(Generator, self).__init__()
-        self.init_size = img_size // 4
-        self.fc = nn.Sequential(
-            nn.Linear(latent_dim, 128 * self.init_size * self.init_size),
-            nn.ReLU(inplace=True),
+    def __init__(self):
+        super().__init__()
+        self.label_emb = nn.Embedding(NUM_CLASSES, EMBED_DIM)
+        self.net = nn.Sequential(
+            # input is (LATENT_DIM + EMBED_DIM)
+            nn.Linear(LATENT_DIM+EMBED_DIM, 256 * 8 * 8),
+            nn.BatchNorm1d(256*8*8),
+            nn.ReLU(True),
+            # reshape to (256,8,8)
+            View((256,8,8)),
+            # upsample to (128,16,16)
+            nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            # upsample to (64,32,32)
+            nn.ConvTranspose2d(128, 64, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            # upsample to (IMG_CHANNELS,64,64)
+            nn.ConvTranspose2d(64, IMG_CHANNELS, 4, 2, 1, bias=False),
+            nn.Tanh()
         )
 
-        self.blocks = nn.Sequential(
-            ResidualBlock(128, 128),
-            SelfAttention(128),  # Attention
-            nn.Upsample(scale_factor=2),
-            ResidualBlock(128, 64),
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(64, img_channels, kernel_size=3, stride=1, padding=1),
-            nn.Tanh(),  # Normalize to [-1, 1]
-        )
+    def forward(self, z, labels):
+        # z: (B, LATENT_DIM), labels: (B,)
+        l = self.label_emb(labels)              # (B,EMBED_DIM)
+        x = torch.cat([z, l], dim=1)            # (B, LATENT_DIM+EMBED_DIM)
+        return self.net(x)
 
-    def forward(self, z):
-        out = self.fc(z)
-        out = out.view(out.size(0), 128, self.init_size, self.init_size)
-        img = self.blocks(out)
-        return img
-
-# Residual Block for Generator
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(ResidualBlock, self).__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(out_channels),
-        )
-        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1)
-
-    def forward(self, x):
-        return self.block(x) + self.shortcut(x)
-
-# Multi-Scale Discriminator
-class MultiScaleDiscriminator(nn.Module):
-    def __init__(self, img_channels, img_size):
-        super(MultiScaleDiscriminator, self).__init__()
-        self.small_scale = self._create_discriminator(img_channels, img_size // 2)
-        self.large_scale = self._create_discriminator(img_channels, img_size)
-
-    def _create_discriminator(self, img_channels, img_size):
-        return nn.Sequential(
-            nn.Conv2d(img_channels, 64, kernel_size=3, stride=2, padding=1),
+# ─── Discriminator ─────────────────────────────────────────────────────────────
+class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.label_emb = nn.Embedding(NUM_CLASSES, EMBED_DIM)
+        self.img_net = nn.Sequential(
+            # input (IMG_CHANNELS,64,64)
+            nn.Conv2d(IMG_CHANNELS, 64, 4, 2, 1, bias=False),  # (64,32,32)
             nn.LeakyReLU(0.2, inplace=True),
-            SelfAttention(64),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(64, 128, 4, 2, 1, bias=False),           # (128,16,16)
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(128, 256, 4, 2, 1, bias=False),          # (256,8,8)
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Flatten(),
-            nn.Linear((img_size // 8) * (img_size // 8) * 256, 1),
+            nn.Flatten(),                                      # (B,256*8*8)
+        )
+        # combine image features + label embedding
+        self.final = nn.Sequential(
+            nn.Linear(256*8*8 + EMBED_DIM, 1),
             nn.Sigmoid(),
         )
 
-    def forward(self, img):
-        small_scale_out = self.small_scale(nn.functional.interpolate(img, scale_factor=0.5))
-        large_scale_out = self.large_scale(img)
-        return 0.5 * (small_scale_out + large_scale_out)
+    def forward(self, img, labels):
+        feat = self.img_net(img)
+        l    = self.label_emb(labels)
+        x    = torch.cat([feat, l], dim=1)
+        return self.final(x)
 
-# Initialize models
-generator = Generator(LATENT_DIM, IMG_CHANNELS, IMG_SIZE).to(DEVICE)
-discriminator = MultiScaleDiscriminator(IMG_CHANNELS, IMG_SIZE).to(DEVICE)
+# ─── Utility: reshape view ─────────────────────────────────────────────────────
+class View(nn.Module):
+    def __init__(self, shape):
+        super().__init__()
+        self.shape = shape
+    def forward(self, x):
+        return x.view(x.size(0), *self.shape)
 
-# Optimizers and Loss
-optimizer_G = torch.optim.Adam(generator.parameters(), lr=LEARNING_RATE, betas=(0.5, 0.999))
-optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=LEARNING_RATE, betas=(0.5, 0.999))
-criterion = nn.BCELoss()
+# ─── Initialize ────────────────────────────────────────────────────────────────
+gen  = Generator().to(DEVICE)
+disc = Discriminator().to(DEVICE)
+optG = torch.optim.Adam(gen.parameters(),  lr=LR, betas=BETAS)
+optD = torch.optim.Adam(disc.parameters(), lr=LR, betas=BETAS)
+adversarial_loss = nn.BCELoss()
 
-# Training Loop
-for epoch in range(EPOCHS):
-    for i, (imgs, _) in enumerate(dataloader):
-        imgs = imgs.to(DEVICE)
+# ─── Training Loop ─────────────────────────────────────────────────────────────
+for epoch in range(1, EPOCHS+1):
+    for i, (imgs, labels) in enumerate(loader):
+        bsz = imgs.size(0)
+        real = torch.full((bsz,1), 1.0, device=DEVICE)
+        fake = torch.full((bsz,1), 0.0, device=DEVICE)
 
-        # Labels
-        real_labels = torch.ones((imgs.size(0), 1)).to(DEVICE)
-        fake_labels = torch.zeros((imgs.size(0), 1)).to(DEVICE)
+        imgs   = imgs.to(DEVICE)
+        labels = labels.to(DEVICE)
 
-        # Train Discriminator
-        z = torch.randn((imgs.size(0), LATENT_DIM)).to(DEVICE)
-        fake_imgs = generator(z)
+        # --- Train Discriminator
+        z = torch.randn(bsz, LATENT_DIM, device=DEVICE)
+        gen_imgs = gen(z, labels)
+        # real
+        out_real = disc(imgs, labels)
+        loss_real = adversarial_loss(out_real, real)
+        # fake
+        out_fake = disc(gen_imgs.detach(), labels)
+        loss_fake = adversarial_loss(out_fake, fake)
+        lossD = (loss_real + loss_fake) / 2
 
-        real_loss = criterion(discriminator(imgs), real_labels)
-        fake_loss = criterion(discriminator(fake_imgs.detach()), fake_labels)
-        loss_D = real_loss + fake_loss
+        optD.zero_grad(); lossD.backward(); optD.step()
 
-        optimizer_D.zero_grad()
-        loss_D.backward()
-        optimizer_D.step()
+        # --- Train Generator
+        z = torch.randn(bsz, LATENT_DIM, device=DEVICE)
+        gen_imgs = gen(z, labels)
+        out_gen  = disc(gen_imgs, labels)
+        lossG = adversarial_loss(out_gen, real)  # want the fake to be classified as real
 
-        # Train Generator
-        gen_loss = criterion(discriminator(fake_imgs), real_labels)
-        optimizer_G.zero_grad()
-        gen_loss.backward()
-        optimizer_G.step()
+        optG.zero_grad(); lossG.backward(); optG.step()
 
-        # Print progress
         if i % 100 == 0:
-            print(f"Epoch [{epoch + 1}/{EPOCHS}], Batch {i}/{len(dataloader)}, Loss D: {loss_D.item():.4f}, Loss G: {gen_loss.item():.4f}")
+            print(f"Epoch {epoch}/{EPOCHS} Batch {i}/{len(loader)} "
+                  f"LossD: {lossD.item():.4f} LossG: {lossG.item():.4f}")
 
-    # Save generated images
-    save_image(fake_imgs.data[:25], f"multi_scale_cgan_images/{epoch + 1}.png", nrow=5, normalize=True)
+    # save a grid of generated samples conditioned on each class
+    with torch.no_grad():
+        fixed_z = torch.randn(NUM_CLASSES, LATENT_DIM, device=DEVICE)
+        fixed_labels = torch.arange(NUM_CLASSES, device=DEVICE)
+        samples = gen(fixed_z, fixed_labels).cpu()
+        save_image(samples, f"{SAVE_DIR}/epoch_{epoch}.png", nrow=NUM_CLASSES, normalize=True)
 
-# Save models
-torch.save(generator.state_dict(), "multi_scale_generator.pth")
-torch.save(discriminator.state_dict(), "multi_scale_discriminator.pth")
+# ─── Save weights ──────────────────────────────────────────────────────────────
+torch.save(gen.state_dict(),  "cgan_generator.pth")
+torch.save(disc.state_dict(), "cgan_discriminator.pth")
